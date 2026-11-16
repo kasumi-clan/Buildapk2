@@ -1,0 +1,350 @@
+name: Build APK từ ZIP
+
+# Upload ZIP dự án Android vào repo (ví dụ thư mục projects/) -> tự build.
+# Hoặc: Actions -> "Build APK từ ZIP" -> Run workflow (để trống ô ZIP = build ZIP mới nhất).
+# File này tự chứa mọi thứ: KHÔNG cần godly-apk-builder-build-engine.zip.
+
+on:
+  push:
+    paths:
+      - '**.zip'
+      - '!godly-apk-builder-build-engine*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Đường dẫn ZIP dự án trong repo (để trống = ZIP mới nhất)'
+        required: false
+        default: ''
+        type: string
+      variant:
+        description: 'Loại build'
+        required: false
+        default: 'debug'
+        type: choice
+        options: [debug, release]
+      java_version:
+        description: 'Phiên bản JDK'
+        required: false
+        default: '17'
+        type: choice
+        options: ['17', '21']
+      gradle_version:
+        description: 'Gradle dự phòng (chỉ dùng khi ZIP thiếu gradle-wrapper.jar)'
+        required: false
+        default: '8.14.3'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VARIANT: ${{ inputs.variant || 'debug' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Chọn ZIP, giải nén an toàn, tìm dự án
+        id: prep
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_ZIP: ${{ inputs.zip_path }}
+          DEFAULT_GRADLE: ${{ inputs.gradle_version || '8.14.3' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, shutil, stat, subprocess, sys, zipfile, zlib
+
+          def fail(msg):
+              print("::error title=Không build được::" + msg)
+              sys.exit(1)
+
+          def git(*a):
+              try:
+                  r = subprocess.run(["git", "-c", "core.quotepath=off", *a], capture_output=True, text=True, check=True)
+                  return r.stdout.splitlines()
+              except Exception:
+                  return []
+
+          def ok(p):  # ZIP dự án hợp lệ (bỏ qua ZIP engine cũ)
+              return (p.lower().endswith(".zip") and "build-engine" not in os.path.basename(p).lower()
+                      and not p.startswith(".github/") and os.path.isfile(p) and not os.path.islink(p)
+                      and not any(ord(c) < 32 for c in p))
+
+          ws = os.path.realpath(".")
+          req = os.environ.get("INPUT_ZIP", "").strip()
+          if req:
+              pick = os.path.normpath(req.replace("\\", "/")).lstrip("/")
+              if pick.startswith("..") or not ok(pick) or not os.path.realpath(pick).startswith(ws + os.sep):
+                  fail("Không dùng được đường dẫn ZIP '%s' (phải là file .zip dự án nằm trong repo)." % req)
+          elif os.environ["EVENT"] == "push":
+              cands = [p for p in git("show", "--name-only", "--pretty=format:", "HEAD") if ok(p)]
+              if not cands:
+                  print("::notice::Commit này không có ZIP dự án mới; bỏ qua.")
+                  open(os.environ["GITHUB_OUTPUT"], "a").write("skip=true\n")
+                  sys.exit(0)
+              pick = cands[0]
+          else:
+              cands = [p for p in git("ls-files", "*.zip") if ok(p)]
+              if not cands:
+                  fail("Không thấy ZIP dự án nào trong repo. Hãy upload ZIP dự án Android lên repo.")
+              def stamp(p):
+                  o = git("log", "-1", "--format=%ct", "--", p)
+                  return int(o[0]) if o else 0
+              pick = max(cands, key=stamp)
+          print("ZIP dự án:", pick)
+
+          # ---- giải nén an toàn: chặn traversal / symlink / ZIP bomb ----
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "src")
+          shutil.rmtree(dest, ignore_errors=True)
+          os.makedirs(dest)
+          dest_real = os.path.realpath(dest)
+          MAX_FILES, MAX_TOTAL, MAX_FILE, RATIO = 20000, 1 << 30, 512 << 20, 200
+          try:
+              z = zipfile.ZipFile(pick)
+              infos = z.infolist()
+              if len(infos) > MAX_FILES:
+                  fail("ZIP có quá nhiều file (giới hạn %d)." % MAX_FILES)
+              if sum(i.file_size for i in infos) > MAX_TOTAL:
+                  fail("ZIP quá lớn sau khi giải nén (nghi ZIP bomb).")
+              total, seen = 0, set()
+              for i in infos:
+                  name = i.filename.replace("\\", "/")
+                  if "\x00" in name or any(ord(c) < 32 for c in name) or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+                      fail("ZIP chứa đường dẫn không an toàn.")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if ".." in parts:
+                      fail("ZIP chứa đường dẫn thoát khỏi thư mục giải nén (path traversal).")
+                  if not parts or parts[0] == "__MACOSX" or parts[-1] == ".DS_Store":
+                      continue
+                  if i.flag_bits & 1:
+                      fail("ZIP có mật khẩu, không được hỗ trợ.")
+                  if i.file_size > MAX_FILE:
+                      fail("Một file trong ZIP quá lớn.")
+                  if i.file_size > (1 << 20) and (i.compress_size == 0 or i.file_size / i.compress_size > RATIO):
+                      fail("Tỉ lệ nén bất thường (nghi ZIP bomb).")
+                  mode = (i.external_attr >> 16) if i.create_system == 3 else 0
+                  kind = stat.S_IFMT(mode)
+                  if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                      continue  # không bao giờ tạo symlink / file đặc biệt
+                  target = os.path.join(dest_real, *parts)
+                  if os.path.commonpath([dest_real, os.path.realpath(target)]) != dest_real:
+                      fail("Đường dẫn giải nén nằm ngoài thư mục cho phép.")
+                  if i.is_dir() or name.endswith("/"):
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  if tuple(parts) in seen:
+                      fail("ZIP có hai file trùng đường dẫn.")
+                  seen.add(tuple(parts))
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  n = 0
+                  with os.fdopen(fd, "wb") as out, z.open(i) as src:
+                      while True:
+                          b = src.read(1 << 20)
+                          if not b:
+                              break
+                          n += len(b)
+                          total += len(b)
+                          if n > i.file_size or total > MAX_TOTAL:
+                              fail("Dung lượng giải nén vượt mức cho phép (nghi ZIP bomb).")
+                          out.write(b)
+                  os.chmod(target, 0o755 if (mode & 0o111) else 0o644)
+          except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError, OSError) as e:
+              fail("ZIP hỏng hoặc không giải nén được: %s" % e)
+
+          # ---- tìm thư mục gốc dự án Android ----
+          SKIP = {"__MACOSX", ".git", "node_modules", "build", ".gradle", ".idea"}
+          found = []
+          for dp, dns, fns in os.walk(dest):
+              rel = os.path.relpath(dp, dest)
+              depth = 0 if rel == "." else rel.count(os.sep) + 1
+              dns[:] = sorted(d for d in dns if d not in SKIP)
+              if depth >= 6:
+                  dns[:] = []
+              if "settings.gradle" in fns or "settings.gradle.kts" in fns:
+                  found.append((depth, not os.path.isfile(os.path.join(dp, "gradlew")), dp))
+          if not found:
+              fail("Không thấy settings.gradle(.kts) trong ZIP. Giải nén ra phải có settings.gradle(.kts), "
+                   "build.gradle(.kts), gradlew, gradle/wrapper/ và thư mục module (vd app/); cho phép 1 thư mục bọc ngoài.")
+          found.sort()
+          root = found[0][2]
+          print("Thư mục dự án:", os.path.relpath(root, dest))
+
+          # ---- loại thứ có thể làm kết quả sai (bản copy trong workspace, ZIP gốc không đổi) ----
+          shutil.rmtree(os.path.join(root, ".gradle"), ignore_errors=True)
+          lp = os.path.join(root, "local.properties")
+          if os.path.isfile(lp):
+              os.remove(lp)
+          for dp, dns, fns in os.walk(root):
+              if os.path.basename(dp) == "build" and os.path.isdir(os.path.join(dp, "outputs")):
+                  shutil.rmtree(os.path.join(dp, "outputs"), ignore_errors=True)
+                  dns[:] = []
+
+          # ---- Gradle wrapper ----
+          wr = os.path.join(root, "gradle", "wrapper")
+          props, jar = os.path.join(wr, "gradle-wrapper.properties"), os.path.join(wr, "gradle-wrapper.jar")
+          has_wrapper = (os.path.isfile(os.path.join(root, "gradlew")) and os.path.isfile(props)
+                         and os.path.isfile(jar) and zipfile.is_zipfile(jar))
+          version = os.environ.get("DEFAULT_GRADLE", "")
+          if os.path.isfile(props):
+              text = open(props, errors="replace").read(65536).replace("\\:", ":")
+              m = re.search(r"distributionUrl\s*=\s*(\S+)", text)
+              if m:
+                  mv = re.search(r"gradle-(\d+(?:\.\d+){1,2})-(?:bin|all)\.zip", m.group(1))
+                  if mv:
+                      version = mv.group(1)
+                  if has_wrapper and not m.group(1).startswith("https://services.gradle.org/"):
+                      fail("distributionUrl trong gradle-wrapper.properties trỏ tới nguồn lạ; chỉ cho phép services.gradle.org.")
+          if not re.match(r"^\d+(\.\d+){1,2}$", version):
+              version = "8.14.3"
+          if not has_wrapper:
+              print("::notice::ZIP thiếu gradlew/gradle-wrapper.jar; sẽ dùng Gradle %s cài sẵn." % version)
+
+          name = re.sub(r"(?i)\.zip$", "", os.path.basename(pick))
+          name = re.sub(r"[^\w.\- ]", "_", name).strip(" .")[:100] or "app"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("skip=false\nproject_dir=%s\napk_name=%s\nuse_wrapper=%s\ngradle_version=%s\n"
+                      % (root, name, "true" if has_wrapper else "false", version))
+          PY
+
+      - name: Cài JDK
+        if: steps.prep.outputs.skip != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version || '17' }}
+
+      - name: Cài Android SDK
+        if: steps.prep.outputs.skip != 'true'
+        uses: android-actions/setup-android@v4
+
+      - name: Cài Gradle dự phòng (chỉ khi ZIP thiếu wrapper)
+        if: steps.prep.outputs.skip != 'true' && steps.prep.outputs.use_wrapper != 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ steps.prep.outputs.gradle_version }}
+          cache-disabled: true
+
+      - name: Build APK
+        id: build
+        if: steps.prep.outputs.skip != 'true'
+        env:
+          PROJECT_DIR: ${{ steps.prep.outputs.project_dir }}
+          USE_WRAPPER: ${{ steps.prep.outputs.use_wrapper }}
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          touch "$RUNNER_TEMP/build.start"
+          if [ "$USE_WRAPPER" = "true" ]; then
+            sed -i 's/\r$//' gradlew
+            chmod +x gradlew
+            CMD=./gradlew
+          else
+            CMD=gradle
+          fi
+          "$CMD" --no-daemon --console=plain "assemble${VARIANT^}" 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+
+      - name: Lấy APK
+        if: steps.build.outcome == 'success'
+        env:
+          PROJECT_DIR: ${{ steps.prep.outputs.project_dir }}
+          APK_NAME: ${{ steps.prep.outputs.apk_name }}
+        run: |
+          mkdir -p out
+          mapfile -t apks < <(find "$PROJECT_DIR" -path '*/build/outputs/apk/*' -path "*/$VARIANT/*" -name '*.apk' ! -path '*androidTest*' -newer "$RUNNER_TEMP/build.start" | sort)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error title=Không thấy APK::Gradle chạy xong nhưng không tạo APK $VARIANT mới. Kiểm tra module có plugin com.android.application không."
+            exit 1
+          fi
+          {
+            echo "## ✅ Build APK thành công"
+            echo
+            echo "| APK | Dung lượng | SHA-256 |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in "${apks[@]}"; do
+            if ! unzip -tqq "$f" > /dev/null || ! unzip -l "$f" | grep -q ' AndroidManifest.xml$'; then
+              echo "::error title=APK không hợp lệ::$(basename "$f") không đạt kiểm tra cấu trúc."
+              exit 1
+            fi
+            if [ "${#apks[@]}" -eq 1 ]; then dest="out/$APK_NAME.apk"; else dest="out/$APK_NAME-$(basename "$f")"; fi
+            cp "$f" "$dest"
+            echo "| \`$(basename "$dest")\` | $(numfmt --to=iec "$(stat -c %s "$dest")") | \`$(sha256sum "$dest" | cut -d' ' -f1)\` |" >> "$GITHUB_STEP_SUMMARY"
+            case "$f" in *unsigned*) echo "::warning title=APK chưa ký::$(basename "$f") chưa được ký nên không cài được trên điện thoại." ;; esac
+          done
+          {
+            echo
+            echo "Tải APK: kéo xuống mục **Artifacts** cuối trang, bấm \`apk-…\` (tải về là file ZIP chứa APK)."
+            echo "**Đã kiểm tra:** Gradle build xong, cấu trúc APK hợp lệ. **Chưa kiểm tra:** cài đặt và chạy thật."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tóm tắt lỗi
+        if: failure() && steps.prep.outputs.skip != 'true'
+        run: |
+          log="$RUNNER_TEMP/gradle.log"
+          mkdir -p out
+          {
+            echo "## ❌ Build thất bại"
+            if [ ! -f "$log" ]; then
+              echo
+              echo "Lỗi xảy ra trước khi Gradle chạy. Mở bước bị đỏ ở trên để xem chi tiết."
+            else
+              hint="Mở log bên dưới để xem chi tiết."
+              if grep -q 'BUILD SUCCESSFUL' "$log"; then
+                hint="Gradle build xong nhưng không tạo APK mới. Kiểm tra module có plugin com.android.application và đã chọn đúng debug/release."
+              elif grep -qE 'SDK location not found|Failed to find Build Tools|Failed to find target with hash|Failed to install the following' "$log"; then
+                hint="Thiếu hoặc sai Android SDK (compileSdk/buildTools trong dự án)."
+              elif grep -qE 'Unsupported class file major version|invalid source release|requires Java|JAVA_HOME' "$log"; then
+                hint="Sai phiên bản JDK. Chạy lại bằng Run workflow và chọn java_version khác (17 hoặc 21)."
+              elif grep -qE 'UnknownHostException|timed out|Connection reset|Could not GET|Could not download' "$log"; then
+                hint="Lỗi mạng khi tải thư viện. Thường chạy lại là được."
+              elif grep -qE 'Could not resolve|Could not find [A-Za-z0-9_.-]+:' "$log"; then
+                hint="Không tìm thấy thư viện hoặc phiên bản trong build.gradle. Kiểm tra tên và phiên bản thư viện."
+              elif grep -qE '^e: ' "$log"; then
+                hint="Lỗi biên dịch Kotlin: sửa code ở file/dòng được báo."
+              elif grep -qE '\.java:[0-9]+: error:' "$log"; then
+                hint="Lỗi biên dịch Java: sửa code ở file/dòng được báo."
+              elif grep -qE 'AAPT|resource linking|resource compilation' "$log"; then
+                hint="Lỗi tài nguyên (res/): kiểm tra file XML hoặc tham chiếu @drawable, @string được báo."
+              elif grep -q 'Manifest merger' "$log"; then
+                hint="Lỗi AndroidManifest.xml hoặc xung đột manifest giữa các thư viện."
+              elif grep -qE 'A problem occurred (evaluating|configuring)|Plugin .* was not found|Could not find method|Script compilation error' "$log"; then
+                hint="Lỗi cấu hình Gradle: kiểm tra build.gradle, settings.gradle và plugin."
+              fi
+              echo
+              echo "**Gợi ý:** $hint"
+              echo
+              echo "**Các dòng lỗi đầu tiên:**"
+              echo '```'
+              grep -E '^e: |\.java:[0-9]+: error:|AAPT: error|What went wrong|^> ' "$log" | grep -vE '^> Task ' | head -n 8 | cut -c1-300 || true
+              echo '```'
+              echo "**40 dòng cuối log:**"
+              echo '```'
+              tail -n 40 "$log" | cut -c1-300
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${hint:-}" ]; then
+            echo "::error title=Build thất bại::$hint"
+          fi
+          [ -f "$log" ] && cp "$log" out/gradle.log || true
+
+      - name: Lưu APK và log
+        if: always() && steps.prep.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-${{ github.run_number }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 14
