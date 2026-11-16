@@ -1,0 +1,112 @@
+name: Build APK từ ZIP
+
+# Upload ZIP dự án Android vào repo (ví dụ thư mục projects/) -> tự build.
+# Hoặc: Actions -> "Build APK từ ZIP" -> Run workflow (để trống ô ZIP = build ZIP mới nhất).
+# File này tự chứa mọi thứ: KHÔNG cần godly-apk-builder-build-engine.zip.
+
+on:
+  push:
+    paths:
+      - '**.zip'
+      - '!godly-apk-builder-build-engine*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Đường dẫn ZIP dự án trong repo (để trống = ZIP mới nhất)'
+        required: false
+        default: ''
+        type: string
+      variant:
+        description: 'Loại build'
+        required: false
+        default: 'debug'
+        type: choice
+        options: [debug, release]
+      java_version:
+        description: 'Phiên bản JDK'
+        required: false
+        default: '17'
+        type: choice
+        options: ['17', '21']
+      gradle_version:
+        description: 'Gradle dự phòng (chỉ dùng khi ZIP thiếu gradle-wrapper.jar)'
+        required: false
+        default: '8.14.3'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VARIANT: ${{ inputs.variant || 'debug' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Chọn ZIP, giải nén an toàn, tìm dự án
+        id: prep
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_ZIP: ${{ inputs.zip_path }}
+          DEFAULT_GRADLE: ${{ inputs.gradle_version || '8.14.3' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, shutil, stat, subprocess, sys, zipfile, zlib
+
+          def fail(msg):
+              print("::error title=Không build được::" + msg)
+              sys.exit(1)
+
+          def git(*a):
+              try:
+                  r = subprocess.run(["git", "-c", "core.quotepath=off", *a], capture_output=True, text=True, check=True)
+                  return r.stdout.splitlines()
+              except Exception:
+                  return []
+
+          def ok(p):  # ZIP dự án hợp lệ (bỏ qua ZIP engine cũ)
+              return (p.lower().endswith(".zip") and "build-engine" not in os.path.basename(p).lower()
+                      and not p.startswith(".github/") and os.path.isfile(p) and not os.path.islink(p)
+                      and not any(ord(c) < 32 for c in p))
+
+          ws = os.path.realpath(".")
+          req = os.environ.get("INPUT_ZIP", "").strip()
+          if req:
+              pick = os.path.normpath(req.replace("\\", "/")).lstrip("/")
+              if pick.startswith("..") or not ok(pick) or not os.path.realpath(pick).startswith(ws + os.sep):
+                  fail("Không dùng được đường dẫn ZIP '%s' (phải là file .zip dự án nằm trong repo)." % req)
+          elif os.environ["EVENT"] == "push":
+              cands = [p for p in git("show", "--name-only", "--pretty=format:", "HEAD") if ok(p)]
+              if not cands:
+                  print("::notice::Commit này không có ZIP dự án mới; bỏ qua.")
+                  open(os.environ["GITHUB_OUTPUT"], "a").write("skip=true\n")
+                  sys.exit(0)
+              pick = cands[0]
+          else:
+              cands = [p for p in git("ls-files", "*.zip") if ok(p)]
+              if not cands:
+                  fail("Không thấy ZIP dự án nào trong repo. Hãy upload ZIP dự án Android lên repo.")
+              def stamp(p):
+                  o = git("log", "-1", "--format=%ct", "--", p)
+                  return int(o[0]) if o else 0
+              pick = max(cands, key=stamp)
+          print("ZIP dự án:", pick)
+
+          # ---- giải nén an toàn: chặn traversal / symlink / ZIP bomb ----
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "src")
+          shutil.rmtree(dest, ignore_errors=True)
+          os.makedirs(dest)
+          dest_real = os.path.realpath(dest)
+          MAX_FILES, MAX_TOTAL, MAX_FILE, RATIO = 20000, 1 << 30, 512 << 20,
